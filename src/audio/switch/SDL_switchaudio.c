@@ -109,54 +109,79 @@ SWITCHAUDIO_OpenDevice(_THIS, const char *devname)
     return 0;
 }
 
-static void
-SWITCHAUDIO_PlayDevice(_THIS)
+static int
+SWITCHAUDIO_FindFreeBuffer(_THIS)
 {
-    int current = -1;
     for (int i = 0; i < 2; i++) {
         if (this->hidden->buffer[i].state == AudioDriverWaveBufState_Free
             || this->hidden->buffer[i].state == AudioDriverWaveBufState_Done) {
-            current = i;
-            break;
+            return i;
         }
     }
+    return -1;
+}
 
-    if (current >= 0) {
-        Uint8 *ptr = (Uint8 *) (this->hidden->pool + (current * this->spec.size));
-        memcpy(ptr, this->hidden->buffer_tmp, this->spec.size);
-        armDCacheFlush(ptr, this->spec.size);
-        audrvVoiceAddWaveBuf(&this->hidden->driver, 0, &this->hidden->buffer[current]);
+static void
+SWITCHAUDIO_PlayDevice(_THIS)
+{
+    Uint8 *ptr;
+    int current;
+
+    audrvUpdate(&this->hidden->driver);
+    current = SWITCHAUDIO_FindFreeBuffer(this);
+    if (current < 0) {
+        /* WaitDevice() leaves a free buffer unless it returned early for shutdown; never block here. */
+        return;
     }
-    else if (!audrvVoiceIsPlaying(&this->hidden->driver, 0)) {
+
+    ptr = (Uint8 *) this->hidden->pool + (current * this->spec.size);
+    memcpy(ptr, this->hidden->buffer_tmp, this->spec.size);
+    armDCacheFlush(ptr, this->spec.size);
+    audrvVoiceAddWaveBuf(&this->hidden->driver, 0, &this->hidden->buffer[current]);
+
+    if (!audrvVoiceIsPlaying(&this->hidden->driver, 0)) {
         audrvVoiceStart(&this->hidden->driver, 0);
     }
 
     audrvUpdate(&this->hidden->driver);
-
-    if (current >= 0) {
-        while (this->hidden->buffer[current].state != AudioDriverWaveBufState_Playing) {
-            audrvUpdate(&this->hidden->driver);
-            audrenWaitFrame();
-        }
-    }
-    else {
-        current = -1;
-        for (int i = 0; i < 2; i++) {
-            if (this->hidden->buffer[i].state == AudioDriverWaveBufState_Playing) {
-                current = i;
-                break;
-            }
-        }
-        while (this->hidden->buffer[current].state == AudioDriverWaveBufState_Playing) {
-            audrvUpdate(&this->hidden->driver);
-            audrenWaitFrame();
-        }
-    }
 }
 
 static void
 SWITCHAUDIO_WaitDevice(_THIS)
 {
+    /* Wait until any wave buffer can be reused. Never wait for a specific buffer to reach
+       AudioDriverWaveBufState_Playing: if this thread runs late by more than one buffer,
+       audrvUpdate() moves that buffer from Queued straight to Done and it never becomes Playing,
+       which used to hang the audio thread forever (silent output, SDL still reporting playing). */
+    const Uint64 start = armGetSystemTick();
+    /* One buffer normally completes within one buffer period; allow 1 s on top of two periods. */
+    const Uint64 timeout_ns = 1000000000ULL + (2000000000ULL * this->spec.samples) / this->spec.freq;
+
+    for (;;) {
+        audrvUpdate(&this->hidden->driver);
+        if (SWITCHAUDIO_FindFreeBuffer(this) >= 0) {
+            break;
+        }
+
+        if (!audrvVoiceIsPlaying(&this->hidden->driver, 0)) {
+            audrvVoiceStart(&this->hidden->driver, 0);
+            audrvUpdate(&this->hidden->driver);
+        }
+
+        /* No buffer completed in time (renderer stalled, e.g. across a suspend): drop the queued buffers and start over. */
+        if (armTicksToNs(armGetSystemTick() - start) > timeout_ns) {
+            audrvVoiceStop(&this->hidden->driver, 0);
+            audrvVoiceStart(&this->hidden->driver, 0);
+            audrvUpdate(&this->hidden->driver);
+            break;
+        }
+
+        if (SDL_AtomicGet(&this->shutdown)) {
+            break;
+        }
+
+        svcSleepThread(2000000);
+    }
 }
 
 static Uint8
